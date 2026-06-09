@@ -1,0 +1,16 @@
+{
+  "name": "medical-iq2",
+  "description": "BeepMed asymmetric IQ2 — medical imatrix on the routed experts",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/medical.dat",
+  "corpus": "~/BEEP/medeval/results/imatrix_corpus_from_eval.txt",
+  "imatrix_max_tokens": 120000,
+  "imatrix_cache": "40GB",
+  "quant": {
+    "routed_w1": "iq2_xxs",
+    "routed_w3": "iq2_xxs",
+    "routed_w2": "q2_k"
+  },
+  "_note": "Families omitted from `quant` (attention, attn_proj, shared, embedding, output) are copied verbatim from `template`, which carries them at Q8_0. List them here to re-quantize from FP instead."
+}

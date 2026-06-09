@@ -1,0 +1,16 @@
+{
+  "name": "coder-iq2",
+  "description": "Asymmetric IQ2 with a CODE-calibrated imatrix (same bit budget, spent on code-hot experts)",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/coder.dat",
+  "corpus": "{models}/coder_corpus.txt",
+  "imatrix_max_tokens": 120000,
+  "imatrix_cache": "40GB",
+  "quant": {
+    "routed_w1": "iq2_xxs",
+    "routed_w3": "iq2_xxs",
+    "routed_w2": "q2_k"
+  },
+  "_note": "Supply a rendered code corpus at `corpus` (e.g. from coding benchmarks / repos). `forgequant build coder-iq2` collects coder.dat then quantizes. Same recipe as medical-iq2, different calibration."
+}

@@ -1,0 +1,25 @@
+# Model weights, imatrices, quant outputs + their manifests — large / local, never committed
+*.gguf
+*.dat
+*.safetensors
+*.manifest.json
+out/
+models/
+
+# Corpora (may contain sensitive prompts)
+*_corpus.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# UI run logs
+runs/

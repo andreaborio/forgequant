@@ -1,0 +1,13 @@
+{
+  "name": "aggressive",
+  "description": "Smallest: IQ2_XXS gate/up AND down (drops the Q2_K down to iq2) — most lossy",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/medical.dat",
+  "quant": {
+    "routed_w1": "iq2_xxs",
+    "routed_w3": "iq2_xxs",
+    "routed_w2": "iq2_xxs"
+  },
+  "_note": "Quant-level preset (swap `imatrix` for your domain). Smallest footprint; the imatrix matters most here. Non-listed families copied from template (Q8_0)."
+}
