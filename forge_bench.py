@@ -79,66 +79,109 @@ def benchy_dir():
         "to your benchy checkout (github.com/andreaborio/benchy)")
 
 
-def load_benchy():
-    """Import benchy's fetch_benchmarks as a module (it is stdlib, importable)."""
-    d = benchy_dir()
-    spec = importlib.util.spec_from_file_location("benchy_fetch",
-                                                  os.path.join(d, "fetch_benchmarks.py"))
+def _import(d, name):
+    spec = importlib.util.spec_from_file_location("benchy_" + name, os.path.join(d, name + ".py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod, d
+    return mod
 
 
-def resolve_keys(fb, sel):
+class Benchy:
+    """Adapter over a benchy checkout: prefers the stable `benchy.api` contract (with
+    lockfile pinning), falls back to the legacy `fetch_benchmarks` internals so an older
+    benchy still works. forge_bench talks ONLY to this — never to benchy internals."""
+    def __init__(self):
+        self.dir = benchy_dir()
+        sys.path.insert(0, self.dir)   # api.py imports `fetch_benchmarks`
+        self.fb = _import(self.dir, "fetch_benchmarks")
+        self.api = None
+        if os.path.exists(os.path.join(self.dir, "api.py")):
+            try:
+                self.api = _import(self.dir, "api")
+            except Exception:
+                self.api = None
+        self.api_version = getattr(self.api, "API_VERSION", None)
+
+    def registry(self):
+        return self.api.registry() if self.api else self.fb.registry_meta()["available"]
+
+    def manual(self):
+        return self.api.manual() if self.api else self.fb.registry_meta()["manual"]
+
+    def all_keys(self):
+        return [b["key"] for b in self.registry()]
+
+    def current_keys(self):
+        return [b["key"] for b in self.registry() if b["tier"] == "current"]
+
+    def domains(self):
+        return {b["domain"] for b in self.registry()}
+
+    def domain_keys(self, dom):
+        return [b["key"] for b in self.registry() if b["domain"] == dom]
+
+    def data_path(self, key):
+        if self.api:
+            return self.api.data_path(key)
+        return os.path.join(getattr(self.fb, "DATA", os.path.join(self.dir, "data")), key + ".jsonl")
+
+    def fetch(self, key):
+        """Fetch (pinned+verified via api when available); return the data path or None."""
+        if self.api:
+            return self.api.fetch(key)
+        n = self.fb.fetch(key)
+        p = self.data_path(key)
+        return p if (n and os.path.exists(p)) else None
+
+
+def resolve_keys(B, sel):
     """A selection string -> ordered unique benchmark keys known to benchy."""
-    reg = fb.REGISTRY
+    known = set(B.all_keys())
+    domains = B.domains()
     keys = []
     for tok in str(sel).split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok in reg:
+        if tok in known:
             keys.append(tok)
         elif tok in BUNDLES:
             keys += BUNDLES[tok]
         elif tok == "current":
-            keys += fb.current_keys()
+            keys += B.current_keys()
         elif tok == "all":
-            keys += list(reg)
-        elif any(s["domain"] == tok for s in reg.values()):   # a raw domain name
-            keys += [k for k, s in reg.items() if s["domain"] == tok]
+            keys += B.all_keys()
+        elif tok in domains:
+            keys += B.domain_keys(tok)
         else:
             die(f"unknown selection '{tok}' (try: a key, a bundle {list(BUNDLES)}, "
                 f"a domain, 'current', or 'all')")
     seen, out = set(), []
     for k in keys:
-        if k in reg and k not in seen:
+        if k in known and k not in seen:
             seen.add(k); out.append(k)
     if not out:
         die(f"selection '{sel}' resolved to no benchmarks")
     return out
 
 
-def data_path(fb, bdir, key):
-    return os.path.join(getattr(fb, "DATA", os.path.join(bdir, "data")), key + ".jsonl")
-
-
-def ensure_fetched(fb, bdir, keys):
-    """Fetch any selected benchmark not already cached in benchy/data. Returns present keys."""
-    present = []
+def ensure_fetched(B, keys):
+    """Fetch any selected benchmark not already cached. Returns (present_keys, {key: path})."""
+    present, paths = [], {}
     for k in keys:
-        p = data_path(fb, bdir, k)
+        p = B.data_path(k)
         if not os.path.exists(p):
             print(f"forge_bench: fetching {k} from benchy …")
-            try:
-                fb.fetch(k)
-            except Exception as e:
-                print(f"forge_bench: ! {k} fetch failed ({e}) — skipping")
-        if os.path.exists(p):
-            present.append(k)
+        try:
+            got = B.fetch(k)
+        except Exception as e:
+            print(f"forge_bench: ! {k} fetch failed ({e}) — skipping")
+            got = p if os.path.exists(p) else None
+        if got and os.path.exists(got):
+            present.append(k); paths[k] = got
     if not present:
         die("nothing fetched (network error, or all selected sets are gated/manual)")
-    return present
+    return present, paths
 
 
 def file_sha(path):
@@ -155,18 +198,18 @@ def build_corpus(sel, out_path, answers=False, mix_domain=None, cap=None,
 
     Returns the run record dict (also written under bench/runs/ when record_run).
     """
-    fb, bdir = load_benchy()
-    keys = resolve_keys(fb, sel)
-    present = ensure_fetched(fb, bdir, keys)
-    inputs = [data_path(fb, bdir, k) for k in present]
+    B = Benchy()
+    keys = resolve_keys(B, sel)
+    present, paths = ensure_fetched(B, keys)
+    inputs = [paths[k] for k in present]
     modes = ("nothink", "think") if mode == "both" else (mode,)
 
     mix_path = None
     if mix_domain:
-        mkeys = ensure_fetched(fb, bdir, resolve_keys(fb, mix_domain))
+        mkeys, mpaths = ensure_fetched(B, resolve_keys(B, mix_domain))
         mix_path = os.path.join(os.path.dirname(out_path) or ".",
                                 f".forgemix_{mix_domain}.txt")
-        forge_corpus.build_corpus_multi([data_path(fb, bdir, k) for k in mkeys],
+        forge_corpus.build_corpus_multi([mpaths[k] for k in mkeys],
                                         mix_path, modes=modes, cap=cap)
 
     n, size, per_file = forge_corpus.build_corpus_multi(
@@ -175,11 +218,19 @@ def build_corpus(sel, out_path, answers=False, mix_domain=None, cap=None,
     if mix_path and os.path.exists(mix_path):
         os.remove(mix_path)
 
+    lock = {}
+    if B.api:
+        try:
+            lk = {r["key"]: r for r in B.api.lock_status()["benchmarks"]}
+            lock = {k: {"upstream_sha": lk[k].get("upstream_sha")} for k in present if k in lk}
+        except Exception:
+            pass
     rec = {"created": datetime.datetime.now().isoformat(timespec="seconds"),
-           "selection": sel, "keys": present, "benchy_dir": bdir,
+           "selection": sel, "keys": present, "benchy_dir": B.dir,
+           "benchy_api": B.api_version,
            "answers": answers, "mix": mix_domain, "cap": cap, "mode": mode,
-           "sources": {k: {"rows_file": data_path(fb, bdir, k),
-                           "sha": file_sha(data_path(fb, bdir, k))} for k in present},
+           "sources": {k: {"rows_file": paths[k], "sha": file_sha(paths[k]),
+                           "upstream_sha": lock.get(k, {}).get("upstream_sha")} for k in present},
            "prompts": n, "corpus": os.path.expanduser(out_path),
            "corpus_bytes": size, "corpus_sha": file_sha(os.path.expanduser(out_path)),
            "per_file": per_file}
@@ -195,31 +246,33 @@ def build_corpus(sel, out_path, answers=False, mix_domain=None, cap=None,
 
 # ---- commands ----
 def cmd_list(_args):
-    fb, _ = load_benchy()
-    meta = fb.registry_meta()
-    print("benchy registry — '✓' cached in benchy/data. fit [mcq]=letter [code]=executed\n")
+    B = Benchy()
+    reg = B.registry()
+    v = f" · api v{B.api_version} (pinned)" if B.api_version else " · legacy (unpinned)"
+    print(f"benchy registry — '✓' cached. fit [mcq]=letter [code]=executed{v}\n")
     for tier, head in (("current", "CURRENT · still discriminating (use these for expert calibration)"),
                        ("legacy", "LEGACY · saturated (regression/sanity only)")):
         print(f"  == {head} ==")
-        for b in meta["available"]:
+        for b in reg:
             if b["tier"] != tier:
                 continue
+            lk = " ·lock" if b.get("locked") else ""
             print(f"   {'✓' if b['present'] else ' '} {b['key']:<14} [{b['fit']}] "
-                  f"{b['domain']:<12} {b['name']}")
+                  f"{b['domain']:<12} {b['name']}{lk}")
         print()
-    if meta.get("manual"):
+    manual = B.manual()
+    if manual:
         print("  == gated / manual (need a HF token; see benchy DATA.md) ==")
-        for m in meta["manual"]:
+        for m in manual:
             print(f"      {m['key']:<14} {m['note']}")
 
 
 def cmd_bundles(_args):
-    fb, _ = load_benchy()
-    reg = fb.REGISTRY
+    B = Benchy()
+    known = set(B.all_keys())
     print("domain bundles — calibrate an expert on its non-saturated benchmarks:\n")
     for name, keys in BUNDLES.items():
-        known = [k for k in keys if k in reg]
-        print(f"  {name:<11} {', '.join(known)}")
+        print(f"  {name:<11} {', '.join(k for k in keys if k in known)}")
     if os.path.isdir(PACKS):
         packs = [f[:-6] for f in sorted(os.listdir(PACKS)) if f.endswith(".jsonl")]
         if packs:
@@ -229,10 +282,10 @@ def cmd_bundles(_args):
 def cmd_fetch(args):
     if not args:
         die("usage: forge_bench.py fetch <key|bundle|domain|current|all>")
-    fb, bdir = load_benchy()
-    keys = resolve_keys(fb, args[0])
-    present = ensure_fetched(fb, bdir, keys)
-    print(f"forge_bench: cached {len(present)} set(s) in {getattr(fb, 'DATA', bdir+'/data')}")
+    B = Benchy()
+    keys = resolve_keys(B, args[0])
+    present, _ = ensure_fetched(B, keys)
+    print(f"forge_bench: cached {len(present)} set(s) in {B.dir}/data")
 
 
 def cmd_corpus(args):

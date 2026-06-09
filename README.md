@@ -102,9 +102,19 @@ Or declare it in a recipe and let `build` do everything:
 `--answers` adds the gold answer as an assistant turn (so the imatrix sees the
 activation paths of *answering*, not just reading); `--mix DOMAIN` interleaves a
 general set so a domain imatrix doesn't over-specialize. Every corpus build records
-its provenance (benchmark keys, row SHAs, options) under `bench/runs/` — tracked in
-the repo, so a calibration is always traceable to the exact benchmark snapshot.
-forgequant never redistributes benchmark data: rows are fetched from HF on demand.
+its provenance (benchmark keys, row SHAs, **upstream dataset commit**, options) under
+`bench/runs/` — tracked in the repo, so a calibration is always traceable to the exact
+benchmark snapshot. forgequant never redistributes benchmark data: rows are fetched
+from HF on demand.
+
+**Pinned & verifiable.** forgequant talks to benchy through its stable `api` contract
+(`benchy/api.py`, `API_VERSION`), never its internals — so a benchy refactor can't
+break forgequant. benchy's `benchmarks.lock.json` pins each benchmark to an exact
+upstream dataset commit + content hash; fetches are verified against it, so upstream
+drift is detected, not silently absorbed. Inspect with `python3 benchy/api.py status`;
+accept an upstream change with `python3 benchy/api.py relock <key>`. If you run against
+an older benchy without `api.py`, forge_bench falls back to the legacy fetcher
+(unpinned) automatically.
 
 ## Seeing the brain paths
 
