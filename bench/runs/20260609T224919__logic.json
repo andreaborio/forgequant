@@ -1,0 +1,25 @@
+{
+  "created": "2026-06-09T22:49:19",
+  "selection": "logic",
+  "keys": [
+    "logic"
+  ],
+  "benchy_dir": "/Users/chinaski/Beep/forgequant/benchy",
+  "answers": true,
+  "mix": null,
+  "cap": 8,
+  "mode": "both",
+  "sources": {
+    "logic": {
+      "rows_file": "/Users/chinaski/Beep/forgequant/benchy/data/logic.jsonl",
+      "sha": "7cb2b874b40b"
+    }
+  },
+  "prompts": 16,
+  "corpus": "/tmp/logic_corpus.txt",
+  "corpus_bytes": 14564,
+  "corpus_sha": "ea4d116b5092",
+  "per_file": {
+    "logic.jsonl": 16
+  }
+}

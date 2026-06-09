@@ -1,0 +1,3 @@
+[submodule "benchy"]
+	path = benchy
+	url = https://github.com/andreaborio/benchy.git

@@ -1,0 +1,13 @@
+{
+  "name": "splice-fast",
+  "description": "Fastest experiment loop: copy hot expert layers from a Q4 donor GGUF into the IQ2 base — minutes, no requantization",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/medical.dat",
+  "splice": {
+    "donor": "{models}/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf",
+    "layers": "auto:6",
+    "out": "{models}/DeepSeek-V4-Flash-{name}.gguf"
+  },
+  "_note": "`forgequant.py splice splice-fast` — pure tensor copy from donor to base (base defaults to the template). Use it to TEST which layers deserve a boost before paying for a full requantize; layers 'auto:6' resolves against the imatrix, or set e.g. \"37-42\". Donor and base must come from the same template family."
+}

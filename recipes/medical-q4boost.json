@@ -1,6 +1,6 @@
 {
-  "name": "medical-iq2",
-  "description": "BeepMed asymmetric IQ2 — medical imatrix on the routed experts",
+  "name": "medical-q4boost",
+  "description": "BeepMed recipe + Q4_K experts on the 6 layers the medical imatrix activates hardest",
   "hf": "{models}/DeepSeek-V4-Flash-FP",
   "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
   "imatrix": "{models}/medical.dat",
@@ -12,5 +12,9 @@
     "routed_w3": "iq2_xxs",
     "routed_w2": "q2_k"
   },
-  "_note": "Families omitted from `quant` (attention, attn_proj, shared, embedding, output) are copied verbatim from `template`, which carries them at Q8_0. List them here to re-quantize from FP instead."
+  "boost": {
+    "layers": "auto:6",
+    "type": "q4_k"
+  },
+  "_note": "medical-iq2 plus a per-layer expert boost driven by the medical imatrix. `paths medical-q4boost` shows WHERE the medical workload lives in the network; `suggest --top N` re-tunes the boost size."
 }

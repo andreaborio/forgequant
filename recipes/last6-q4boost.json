@@ -1,0 +1,17 @@
+{
+  "name": "last6-q4boost",
+  "description": "ds4's proven mixed experiment as a recipe: last six expert layers (37-42) at Q4_K, rest IQ2",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/medical.dat",
+  "quant": {
+    "routed_w1": "iq2_xxs",
+    "routed_w3": "iq2_xxs",
+    "routed_w2": "q2_k"
+  },
+  "boost": {
+    "layers": "37-42",
+    "type": "q4_k"
+  },
+  "_note": "Static-layer variant of the boost (no imatrix analysis needed to resolve the layers; swap `imatrix` for your domain). Mirrors ds4's gguf-tools/mixed last-six-layers experiment (~91 GB vs ~153 GB full Q4) but requantizes in one pass instead of splicing."
+}

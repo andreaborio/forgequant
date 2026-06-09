@@ -1,13 +1,13 @@
 {
   "name": "balanced",
-  "description": "Higher-quality experts: IQ3 gate/up + Q3_K down (bigger than iq2, less lossy)",
+  "description": "Higher-quality experts: Q4_K gate/up + Q2_K down (bigger than iq2, less lossy)",
   "hf": "{models}/DeepSeek-V4-Flash-FP",
   "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
   "imatrix": "{models}/medical.dat",
   "quant": {
-    "routed_w1": "iq3_xxs",
-    "routed_w3": "iq3_xxs",
-    "routed_w2": "q3_k"
+    "routed_w1": "q4_k",
+    "routed_w3": "q4_k",
+    "routed_w2": "q2_k"
   },
-  "_note": "Quant-level preset (swap `imatrix` for your domain). More bits on the experts => larger file, higher fidelity than the iq2 presets. Non-listed families copied from template (Q8_0)."
+  "_note": "Quant-level preset (swap `imatrix` for your domain). deepseek4-quantize can only PRODUCE iq2_xxs, q2_k, q4_k, q8_0 (ds4q_can_quantize); q3_k/iq3_xxs are not producible. Q4_K gate/up keeps far more of the experts than iq2 while the q2_k down stays small. Non-listed families copied from template (Q8_0)."
 }

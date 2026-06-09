@@ -6,8 +6,11 @@
 out/
 models/
 
-# Corpora (may contain sensitive prompts)
+# Corpora (derived from licensed benchmark data — never redistribute; rebuildable from benchy)
 *_corpus.txt
+bench/corpora/
+.forgemix_*.txt
+*.fqstats.json
 
 # Python
 __pycache__/
@@ -21,5 +24,5 @@ venv/
 .idea/
 .vscode/
 
-# UI run logs
-runs/
+# UI run logs (repo-root only; bench/runs/ provenance IS tracked)
+/runs/
