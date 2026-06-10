@@ -784,6 +784,10 @@ function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
       const dr=row.heat.map((h,e)=>(h/ss*row.share)-(br?(br.heat[e]/bs*br.share):0));
       D.push(dr);dr.forEach(d=>{if(Math.abs(d)>maxd)maxd=Math.abs(d);});});
     const identical=maxd<1e-5;let changed=0;
+    // faint base grid: keep every untouched cell visible as a dark-grey square instead of losing
+    // it in the black background, so the map still reads as a full grid with only the changes lit
+    ctx.fillStyle='#242428';
+    s.layers.forEach((row,i)=>{for(let e=0;e<E;e++)ctx.fillRect(e*cw,i*chh,cw-1,chh-1);});
     if(!identical)s.layers.forEach((row,i)=>{D[i].forEach((d,e)=>{const m=Math.abs(d)/maxd;if(m<0.06)return;changed++;
       const c=Math.round(45+m*210);
       ctx.fillStyle=d>0?`rgb(${c},${Math.round(c*0.5)},${Math.round(c*0.3)})`:`rgb(${Math.round(c*0.35)},${Math.round(c*0.65)},${c})`;
