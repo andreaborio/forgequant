@@ -252,6 +252,10 @@ def _clear_active():
     try: os.remove(ACTIVE)
     except OSError: pass
 
+def _load_active():
+    try: return json.load(open(ACTIVE))
+    except Exception: return None
+
 def _reattach_locked():
     """If a previously-launched job is still alive (per active.json), rebuild JOB for it
     with proc=None (we only have the pid across a restart). Caller holds JOB_LOCK."""
@@ -328,8 +332,14 @@ N_LAYERS = 43                                                   # the long exper
 
 def job_status():
     with JOB_LOCK:                       # consistent snapshot vs start_job's clear()+update()
-        if not JOB and not _reattach_locked():
-            return {"running": False, "idle": True}
+        if not JOB:
+            if not _reattach_locked():
+                return {"running": False, "idle": True}
+        elif not _job_alive_locked():
+            # the tracked job ended — if a different live job is now active on disk, switch to it
+            a = _load_active()
+            if a and a.get("pid") != JOB.get("pid") and _pid_alive(a.get("pid")):
+                JOB.clear(); _reattach_locked()
         p = JOB.get("proc"); pid = JOB.get("pid")
         action, recipe, log = JOB.get("action"), JOB.get("recipe"), JOB.get("log")
         started, last_phase = JOB.get("started", time.time()), JOB.get("phase")
