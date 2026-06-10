@@ -191,6 +191,75 @@ def suggest_boost_diff(stats_a, stats_b, n):
     return sorted(r["layer"] for r in sorted(rows, key=lambda r: r["cosine"])[:n])
 
 
+# ---- contrast: where does a domain spend its activation DIFFERENTLY from a baseline? ----
+# Absolute energy heatmaps look near-identical across domains (load-balanced routing), so a
+# side-by-side of two 43x256 grids shows nothing. The signal is the DIVERGENCE: normalize each
+# imatrix to a global per-(layer,expert) distribution, then compare. Collapsed to one number
+# per layer it becomes legible — a diverging bar per layer instead of 11008 squares.
+
+def _dist(stats):
+    """Per-(layer, expert) share of total activation energy (a global distribution): the
+    layer's real energy share spread over its experts. Weighting by `share` (not the
+    per-family-max-normalized `combined`) keeps hot layers heavier — matches _cached_dist."""
+    out = {}
+    for r in stats["layers"]:
+        c = r["combined"]; s = sum(c) or 1.0
+        out[r["layer"]] = [v / s * r["share"] for v in c]
+    return out
+
+
+def contrast(domain_stats, base_stats):
+    """Per-layer divergence of `domain` from `base`. Returns rows sorted by divergence desc:
+      net:        signed lean (domain share - base share); >0 = domain emphasizes this layer
+      divergence: sum of positive per-expert deltas (captures within-layer reshuffling even
+                  when net~0 — i.e. the domain drives DIFFERENT experts in the same layer)
+      lean:       'domain' | 'base'
+      experts:    the experts the domain drives most distinctively here (by delta)
+    """
+    if domain_stats["n_experts"] != base_stats["n_experts"]:
+        raise ImatrixError("imatrices have different expert counts")
+    d, b = _dist(domain_stats), _dist(base_stats)
+    rows = []
+    for layer in sorted(set(d) & set(b)):
+        dv, bv = d[layer], b[layer]
+        deltas = [x - y for x, y in zip(dv, bv)]
+        net = sum(deltas)
+        divergence = sum(x for x in deltas if x > 0)
+        experts = sorted(range(len(deltas)), key=lambda e: -deltas[e])[:8]
+        rows.append({"layer": layer, "net": net, "divergence": divergence,
+                     "lean": "domain" if net >= 0 else "base",
+                     "experts": [e for e in experts if deltas[e] > 0]})
+    return sorted(rows, key=lambda r: -r["divergence"])
+
+
+def suggest_contrast(domain_stats, base_stats, n):
+    """The n layers the domain uses most DIFFERENTLY from the baseline (top divergence)."""
+    return sorted(r["layer"] for r in contrast(domain_stats, base_stats)[:n])
+
+
+def contrast_bars(rows, domain="domain", base="base", n=None, width=28):
+    """Diverging bar chart: one row per layer, length ∝ divergence, arrow = which way it leans.
+    Sorted so the most domain-distinctive layers are on top — the point that the grid hides."""
+    rows = rows[:n] if n else rows
+    mx = max((r["divergence"] for r in rows), default=0.0) or 1.0
+    out = [f"contrast  {domain} ↔ {base}   (bar = how differently this layer is used;  "
+           f"▶ {domain}-leaning · ◀ {base}-leaning)"]
+    for r in rows:
+        fill = int(round(r["divergence"] / mx * width))
+        arrow = "▶" if r["lean"] == "domain" else "◀"
+        bar = "█" * fill + "·" * (width - fill)
+        exp = (" exp " + ",".join(str(e) for e in r["experts"][:5])) if r["experts"] else ""
+        out.append(f"blk.{r['layer']:>2} {arrow} {bar} {r['divergence'] * 100:5.2f}%{exp}")
+    return "\n".join(out)
+
+
+def contrast_json(rows, n=None):
+    rows = rows[:n] if n else rows
+    return [{"layer": r["layer"], "divergence": round(r["divergence"], 5),
+             "net": round(r["net"], 5), "lean": r["lean"], "experts": r["experts"]}
+            for r in rows]
+
+
 def boost_size_delta(stats, layers, from_type, to_type, families=("w1", "w2", "w3")):
     """Estimated GGUF growth in bytes when upcasting `layers` from from_type to to_type."""
     fcols = stats["families"]
@@ -289,6 +358,31 @@ def diff_cached(ca, cb):
         rows.append({"layer": rb["layer"], "cosine": dot / (na * nb),
                      "share_delta": rb["share"] - ra["share"], "experts_only_b": only_b})
     return rows
+
+
+def _cached_dist(c):
+    """Reconstruct a global per-(layer, expert) share distribution from a cached_stats dict.
+    heat is per-layer-max normalized; share is the layer's fraction of total energy, so
+    expert global share = heat[e]/sum(heat) * layer_share."""
+    out = {}
+    for r in c["layers"]:
+        s = sum(r["heat"]) or 1.0
+        out[r["layer"]] = [h / s * r["share"] for h in r["heat"]]
+    return out
+
+
+def contrast_cached(cdomain, cbase):
+    """contrast() on two cached_stats() dicts (for the UI — no .dat re-parse)."""
+    d, b = _cached_dist(cdomain), _cached_dist(cbase)
+    rows = []
+    for layer in sorted(set(d) & set(b)):
+        deltas = [x - y for x, y in zip(d[layer], b[layer])]
+        net = sum(deltas)
+        divergence = sum(x for x in deltas if x > 0)
+        experts = [e for e in sorted(range(len(deltas)), key=lambda e: -deltas[e])[:8] if deltas[e] > 0]
+        rows.append({"layer": layer, "net": net, "divergence": divergence,
+                     "lean": "domain" if net >= 0 else "base", "experts": experts})
+    return sorted(rows, key=lambda r: -r["divergence"])
 
 
 def boost_delta_cached(c, layers, from_type, to_type, families=("w1", "w2", "w3")):

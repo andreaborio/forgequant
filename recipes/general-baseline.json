@@ -1,0 +1,14 @@
+{
+  "name": "general-baseline",
+  "description": "Utility: collect a GENERAL imatrix (broad benchy mix) to contrast domain imatrices against",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/general.dat",
+  "bench": {
+    "domain": "broad",
+    "cap": 300
+  },
+  "imatrix_max_tokens": 120000,
+  "imatrix_cache": "40GB",
+  "_note": "Not for quantizing — just run `forgequant.py imatrix general-baseline` to produce general.dat from a broad, multi-domain corpus (MMLU-Pro + SuperGPQA + HumanEval + MedXpertQA + TruthfulQA). Domain recipes with a `contrast` boost point `boost.baseline` here: the boost then upcasts the layers a domain uses DIFFERENTLY from this general baseline."
+}

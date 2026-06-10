@@ -1,0 +1,28 @@
+{
+  "name": "coder-contrast",
+  "description": "CODE-specialized via CONTRAST: Q4_K on the layers code uses differently from a general baseline (not just the generally-hot ones)",
+  "hf": "{models}/DeepSeek-V4-Flash-FP",
+  "template": "{models}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+  "imatrix": "{models}/coder.dat",
+  "bench": {
+    "keys": ["humaneval", "mbpp", "mmlu_cs"],
+    "answers": true,
+    "mix": "reasoning",
+    "cap": 400
+  },
+  "imatrix_max_tokens": 120000,
+  "imatrix_cache": "40GB",
+  "quant": {
+    "routed_w1": "iq2_xxs",
+    "routed_w3": "iq2_xxs",
+    "routed_w2": "q2_k"
+  },
+  "boost": {
+    "mode": "contrast",
+    "baseline": "{models}/general.dat",
+    "layers": "auto:6",
+    "type": "q4_k"
+  },
+  "overwrite": true,
+  "_note": "The contrast variant of coder-q4boost. Where `coder-q4boost` boosts the 6 highest-ENERGY layers (which are nearly the same for every domain), this boosts the 6 layers the code imatrix diverges most from `general.dat` — the actually code-distinctive layers. Build general.dat first: `forgequant.py imatrix general-baseline`. Inspect the difference with `forgequant.py paths coder.dat --contrast general.dat`."
+}

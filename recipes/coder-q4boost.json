@@ -21,5 +21,6 @@
     "layers": "auto:6",
     "type": "q4_k"
   },
+  "overwrite": true,
   "_note": "The `bench` block calibrates on REAL, non-saturated code benchmarks fetched from benchy (HumanEval + MBPP + MMLU-CS), with gold answers included and a reasoning mix to avoid overfit. `forgequant build coder-q4boost` fetches+renders the corpus, collects coder.dat, then quantizes with the 6 code-hottest layers upcast to Q4_K. `paths coder-q4boost` shows the activation map; `suggest` re-tunes the layer count."
 }

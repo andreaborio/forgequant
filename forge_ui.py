@@ -77,6 +77,38 @@ QUANT_TYPES = ["", "iq2_xxs", "q2_k", "q4_k", "q8_0", "bf16", "f16"]
 BOOST_TYPES = ["q4_k", "q8_0", "bf16"]
 FAMILIES = ["routed_w1", "routed_w2", "routed_w3", "attention", "attn_proj", "shared", "embedding", "output"]
 
+# Evidence-based boost guidance (from a verified deep-research pass; see commit notes). Drives
+# the dashboard's boost presets + notes so the control is self-explanatory and the defaults sound.
+BOOST_GUIDE = {
+    "tooltip": "Upcast the routed experts of the N most active layers to Q4_K. down-proj is the most "
+               "quant-sensitive tensor, so boost it first; quality gains flatten above ~4-bit.",
+    "default_n": 6,
+    "presets": [
+        {"key": "small", "n": 6, "type": "q4_k", "families": ["w2"],
+         "label": "down-proj only · 6L",
+         "when": "Tightest budget: down-proj (w2) is the most quant-sensitive expert tensor, so boosting "
+                 "just it on the 6 hottest layers buys most of the gain for ~1/4 the size."},
+        {"key": "medium", "n": 6, "type": "q4_k", "families": ["w1", "w2", "w3"],
+         "label": "all experts · 6L · recommended",
+         "when": "Recommended. The 6 hottest layers (~14% of 43), all three expert families to Q4_K — the "
+                 "steep part of the 2→4-bit curve. Mirrors ds4's proven last-6 mixed experiment."},
+        {"key": "aggressive", "n": 8, "type": "q4_k", "families": ["w1", "w2", "w3"],
+         "label": "all experts · 8L",
+         "when": "More headroom: 8 of 43 layers. Beyond ~10 layers / ~4-5 bpw the curve flattens "
+                 "(4→5-bit adds little), so going higher mostly costs GB."},
+    ],
+    "selection": "Energy (default) ranks layers by activation intensity — the best single-imatrix proxy "
+                 "for quant sensitivity. Contrast needs a domain + a baseline imatrix and instead finds "
+                 "the layers a domain uses differently (for specializing a build).",
+    "notes": [
+        "down-proj (w2) is the most quant-sensitive expert tensor — if budget is tight, boost it first.",
+        "2→4-bit is a big jump (~+3.9 pts Aider Polyglot); 4→5-bit adds ~+1.0 — so Q4_K is the target.",
+        "Concentrate bits on a few layers, don't spread thin — layer-wise beats expert-wise.",
+        "Prefer the first MoE blocks, then add the last 1-2 (model-specific, moderate evidence).",
+        "N=6 is a sound heuristic, not a measured optimum for V4-Flash — A/B with benchy to find the knee.",
+    ],
+}
+
 def list_imatrices():
     out = []
     for d in sorted(glob.glob(os.path.join(MODELS_DIR, "*.dat")), key=os.path.getmtime, reverse=True):
@@ -111,13 +143,21 @@ def imatrix_diff(a, b):
     boost = sorted(r["layer"] for r in sorted(rows, key=lambda r: r["cosine"])[:6])
     return {"rows": rows, "boost": boost}
 
-def suggest(name, top, to_type):
+# base type each expert family sits at before a boost (so the size delta is accurate)
+BOOST_BASE = {"w1": "iq2_xxs", "w3": "iq2_xxs", "w2": "q2_k"}
+
+def boost_gb(s, layers, to_type, families):
+    total = sum(forge_imatrix.boost_delta_cached(s, layers, BOOST_BASE[f], to_type, families=(f,))
+                for f in families if f in BOOST_BASE)
+    return round(total / 1e9, 1)
+
+def suggest(name, top, to_type, families=("w1", "w2", "w3")):
     s = imatrix_stats(name)
     if s.get("error"):
         return s
     layers = sorted(s["hot_layers"][:top])
-    delta = forge_imatrix.boost_delta_cached(s, layers, "iq2_xxs", to_type)
-    return {"layers": layers, "type": to_type, "delta_gb": round(delta / 1e9, 1)}
+    return {"layers": layers, "type": to_type, "families": list(families),
+            "delta_gb": boost_gb(s, layers, to_type, families)}
 
 def defaults():
     """hf/template defaults, lifted from an existing recipe so the builder is prefilled."""
@@ -160,8 +200,14 @@ def save_recipe(d):
             return {"ok": False, "error": "boost type must be one of " + ", ".join(BOOST_TYPES)}
         if not re.fullmatch(r"(auto:\d+|\d+(-\d+)?(,\d+(-\d+)?)*)", str(b["layers"]).strip()):
             return {"ok": False, "error": "boost layers: use auto:N, 37-42, or a comma list"}
-        nb = dict(rec.get("boost") or {})        # preserve boost.families the builder can't edit
+        nb = dict(rec.get("boost") or {})        # preserve fields the payload omits
         nb.update({"layers": b["layers"].strip(), "type": b["type"]})
+        if "families" in b:                       # key present -> set/clear; absent -> keep existing
+            fams = [f for f in (b.get("families") or []) if f in ("w1", "w2", "w3")]
+            if fams and set(fams) != {"w1", "w2", "w3"}:
+                nb["families"] = fams             # a subset (e.g. down-proj only)
+            else:
+                nb.pop("families", None)          # all three -> default, drop the key
         rec["boost"] = nb
     elif "boost" in d:  # builder sent an explicitly cleared boost
         rec.pop("boost", None)
@@ -178,9 +224,58 @@ def save_recipe(d):
     return {"ok": True, "saved": name}
 
 # ---------------- job control ----------------
+# A launched job is also persisted to runs/active.json so the dashboard can RE-ATTACH to it
+# after a restart (the job runs in its own session and outlives the UI). Without this, a UI
+# restart loses the in-memory handle and a still-running quantize shows as "idle".
+ACTIVE = os.path.join(RUNS, "active.json")
+
+def _pid_alive(pid):
+    if not pid: return False
+    try:
+        os.kill(pid, 0); return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+def _save_active(j):
+    try:
+        with open(ACTIVE, "w") as f:
+            json.dump({"recipe": j["recipe"], "action": j["action"], "log": j["log"],
+                       "pid": j["proc"].pid, "started": j["started"]}, f)
+    except Exception:
+        pass
+
+def _clear_active():
+    try: os.remove(ACTIVE)
+    except OSError: pass
+
+def _reattach_locked():
+    """If a previously-launched job is still alive (per active.json), rebuild JOB for it
+    with proc=None (we only have the pid across a restart). Caller holds JOB_LOCK."""
+    try:
+        a = json.load(open(ACTIVE))
+    except Exception:
+        return False
+    if _pid_alive(a.get("pid")):
+        JOB.clear()
+        JOB.update({"recipe": a.get("recipe"), "action": a.get("action"), "log": a.get("log"),
+                    "started": a.get("started", time.time()), "proc": None, "pid": a.get("pid"),
+                    "samples": [], "reattached": True})
+        return True
+    _clear_active()
+    return False
+
+def _job_alive_locked():
+    p = JOB.get("proc")
+    return (p.poll() is None) if p is not None else _pid_alive(JOB.get("pid"))
+
 def start_job(recipe, action):
     with JOB_LOCK:
-        if JOB.get("proc") and JOB["proc"].poll() is None:
+        if not JOB: _reattach_locked()
+        if JOB and _job_alive_locked():
             return {"ok": False, "error": "a job is already running"}
         if action not in ACTIONS:
             return {"ok": False, "error": "bad action"}
@@ -195,47 +290,58 @@ def start_job(recipe, action):
         JOB.clear()
         JOB.update({"recipe": recipe, "action": action, "log": log,
                     "started": time.time(), "proc": proc, "samples": []})
+        _save_active(JOB)
     return {"ok": True, "started": {"recipe": recipe, "action": action}}
 
 def stop_job():
     with JOB_LOCK:
+        if not JOB: _reattach_locked()
         p = JOB.get("proc")
+        pid = p.pid if p is not None else JOB.get("pid")
         action = JOB.get("action")
-    if not (p and p.poll() is None):
+        alive = JOB and _job_alive_locked()
+    if not (alive and pid):
         return {"ok": True, "stopped": False}
     # capture flushes a ~440 MB imatrix on SIGINT/SIGTERM — give it room before SIGKILL.
     grace = 25.0 if action == "capture" else 6.0
+    def still():
+        return (p.poll() is None) if p is not None else _pid_alive(pid)
     try:
         sig = signal.SIGINT if action == "capture" else signal.SIGTERM
-        os.killpg(os.getpgid(p.pid), sig)   # own session -> the ds4 children get it too
+        os.killpg(os.getpgid(pid), sig)   # own session -> the ds4 children get it too
         deadline = time.time() + grace
         while time.time() < deadline:
-            if p.poll() is not None:
-                return {"ok": True, "stopped": True}
+            if not still():
+                _clear_active(); return {"ok": True, "stopped": True}
             time.sleep(0.2)
-        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
     except Exception:
-        try: p.kill()
+        try: os.kill(pid, signal.SIGKILL)
         except Exception: pass
+    _clear_active()
     return {"ok": True, "stopped": True}
 
 TENSOR_RE = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
 TOK_RE = re.compile(r"tokens[=: ]+(\d+)")
+LAYER_RE = re.compile(r"generate_expert_tensor: layer (\d+)")   # the reliable progress during
+N_LAYERS = 43                                                   # the long expert-quant phase (Flash)
 
 def job_status():
     with JOB_LOCK:                       # consistent snapshot vs start_job's clear()+update()
-        if not JOB:
+        if not JOB and not _reattach_locked():
             return {"running": False, "idle": True}
-        p = JOB.get("proc")
+        p = JOB.get("proc"); pid = JOB.get("pid")
         action, recipe, log = JOB.get("action"), JOB.get("recipe"), JOB.get("log")
         started, last_phase = JOB.get("started", time.time()), JOB.get("phase")
-    running = p is not None and p.poll() is None
-    rc = None if running or p is None else p.returncode
-    tail, n, m, toks = "", None, None, None
+        reattached = JOB.get("reattached", False)
+    is_child = p is not None
+    running = (p.poll() is None) if is_child else _pid_alive(pid)
+    rc = (None if running else p.returncode) if is_child else None
+    tail, n, m, toks, layer = "", None, None, None, None
     phase = last_phase or {"capture": "capture", "splice": "splice"}.get(action, "starting")
     try:
         with open(log, "rb") as f:
-            f.seek(0, 2); sz = f.tell(); f.seek(max(0, sz - 8000)); data = f.read().decode("utf-8", "ignore")
+            f.seek(0, 2); sz = f.tell(); f.seek(max(0, sz - 16000)); data = f.read().decode("utf-8", "ignore")
         tail = data
         for ln in data.splitlines():
             if "deepseek4-quantize" in ln and "forgequant$" in ln: phase = "quantize"
@@ -246,36 +352,68 @@ def job_status():
             if mt:
                 a, b = int(mt.group(1)), int(mt.group(2))
                 if 0 < b and a <= b: n, m = a, b
+            lm = LAYER_RE.search(ln)
+            if lm: layer = int(lm.group(1))           # expert-quant layer (0..42) — the long phase
             tk = TOK_RE.search(ln)
             if tk: toks = int(tk.group(1))
     except Exception:
         pass
+    # the launch line may have scrolled out of the tail (esp. on re-attach) — infer from progress
+    if phase == "starting":
+        if layer is not None or m: phase = "quantize"
+        elif toks: phase = "imatrix"
+    # pick the progress signal the bar + ETA both use: during the long expert-quant phase the
+    # layer counter is reliable (the tensor index stalls there); otherwise the tensor index.
+    if layer is not None and phase == "quantize":
+        prog, total, metric = layer + 1, N_LAYERS, "layer"
+    else:
+        prog, total, metric = n, m, "tensor"
+    pct = (100.0 * prog / total) if (prog is not None and total) else None
     eta = rate = None
     with JOB_LOCK:
-        if JOB.get("proc") is p and p is not None:   # still the same job
-            if phase not in ("starting",):
+        if JOB.get("log") == log:                    # still the same job (child or re-attached)
+            if phase != "starting":
                 JOB["phase"] = phase                 # latch: survives the launch line scrolling away
             if not running:
                 JOB.setdefault("ended", time.time())  # freeze elapsed at finish
+                _clear_active()                       # job no longer alive -> drop persisted state
             ended = JOB.get("ended")
-            if running and n is not None and m:       # ETA from recent (time, n) samples
-                s = JOB.setdefault("samples", [])
-                if not s or s[-1][1] != n: s.append((time.time(), n))
-                s[:] = s[-12:]
-                if len(s) >= 2 and s[-1][1] > s[0][1]:
-                    rate = (s[-1][1] - s[0][1]) / max(1e-6, s[-1][0] - s[0][0])
-                    if rate > 0: eta = round((m - n) / rate)
+            if running and prog is not None and total:
+                if metric == "layer":
+                    # layers tick every ~minutes, so a short sample window never sees a change;
+                    # use the stable overall average since the job started -> realistic, jitter-free
+                    el = (ended or time.time()) - started
+                    if prog > 0 and el > 2:
+                        eta = round((total - prog) * (el / prog))
+                else:
+                    s = JOB.setdefault("samples", [])  # tensor index moves fast -> windowed rate
+                    if not s or s[-1][1] != prog: s.append((time.time(), prog))
+                    s[:] = s[-12:]
+                    if len(s) >= 2 and s[-1][1] > s[0][1]:
+                        rate = (s[-1][1] - s[0][1]) / max(1e-6, s[-1][0] - s[0][0])
+                        if rate > 0: eta = round((total - prog) / rate)
         else:
             ended = None
-    failed = (not running) and rc not in (0, None) and rc > 0
-    stopped = (not running) and rc is not None and rc < 0
-    done = (not running) and rc == 0
-    sig = signal.Signals(-rc).name if (rc is not None and rc < 0) else None
-    return {"running": running, "idle": False, "recipe": recipe,
+    # terminal state: rc when we own the child; else infer from the log's end markers
+    if is_child:
+        done = (not running) and rc == 0
+        failed = (not running) and rc not in (0, None) and rc > 0
+        stopped = (not running) and rc is not None and rc < 0
+    else:
+        low = tail.lower()
+        done = (not running) and ("forgequant: done ->" in tail or "forgequant: spliced" in tail
+                                  or "forgequant: manifest ->" in tail)
+        failed = (not running) and (not done) and ("fail" in low or "exited with code" in tail
+                                                    or "traceback" in low)
+        stopped = (not running) and (not done) and (not failed)
+    sig = signal.Signals(-rc).name if (is_child and rc is not None and rc < 0) else None
+    return {"running": running, "idle": False, "recipe": recipe, "reattached": reattached,
             "action": action, "rc": rc, "signal": sig,
             "phase": phase if running else ("done" if done else "stopped" if stopped else "failed"),
-            "n": n, "m": m, "tokens": toks, "rate": round(rate, 2) if rate else None, "eta_s": eta,
-            "elapsed_s": round((ended or time.time()) - started), "tail": tail[-3500:],
+            "n": n, "m": m, "layer": layer, "n_layers": N_LAYERS,
+            "pct": round(pct, 1) if pct is not None else None,
+            "tokens": toks, "rate": round(rate, 2) if (rate and metric == "tensor") else None,
+            "eta_s": eta, "elapsed_s": round((ended or time.time()) - started), "tail": tail[-3500:],
             "done": done, "failed": failed}
 
 def list_runs():
@@ -363,15 +501,29 @@ tr:last-child td{border-bottom:none}
 canvas{display:block;width:100%;image-rendering:pixelated}
 .legend{display:flex;gap:14px;font-size:12px;color:var(--mut2);margin-top:8px;align-items:center}
 .lay{font-size:12px;color:var(--mut);font-family:ui-monospace,Menlo,monospace;margin-top:6px;min-height:17px}
+.bb{font-size:12px;padding:4px 11px;border-radius:999px;margin-bottom:10px;border:1px solid var(--bd2);display:inline-block}
+.bb.ok{color:var(--ok);border-color:#1e4d39;background:#0c1a14}
+.bb.hot{color:var(--hot);border-color:#4a3a1a;background:#1a1407}
 a.lnk{color:var(--info);text-decoration:none;cursor:pointer}
+.preset{display:flex;flex-direction:column;gap:3px;align-items:flex-start;text-align:left;padding:9px 12px;height:auto;border-radius:9px;background:var(--el);border:1px solid var(--bd2);min-width:150px}
+.preset:hover{border-color:#5a5a5a;background:#161616}
+.preset.sel{border-color:var(--hot);background:#1a1407}
+.preset b{font-size:12px;font-weight:600;color:var(--fg)}
+.preset .pg{font-size:11px;color:var(--hot);font-family:ui-monospace,Menlo,monospace}
+.preset.rec b::after{content:" ★";color:var(--hot)}
+.gtk{font-size:12px;color:var(--mut);line-height:1.65;margin-top:10px;max-width:78ch}
+.gtk b{color:var(--fg);font-weight:500}
+.gtk li{margin:2px 0}
+details.gtk>summary{cursor:pointer;color:var(--info);list-style:none}
+details.gtk>summary::-webkit-details-marker{display:none}
 </style></head><body><div class="wrap">
 <header>
   <h1><svg class="ic" style="width:18px;height:18px;color:var(--fg);margin-right:10px" viewBox="0 0 24 24"><path d="m15 12-8.5 8.5a2.12 2.12 0 1 1-3-3L12 9"/><path d="M17.64 15 22 10.64"/><path d="m20.91 11.7-1.25-1.25c-.6-.6-.93-1.4-.93-2.25v-.86L16.01 4.6a5.56 5.56 0 0 0-3.94-1.64H9l.92.82A6.18 6.18 0 0 1 12 8.4v1.56l2 2h2.47l2.26 1.91"/></svg><b>forge</b>quant</h1>
-  <div class="sub">Asymmetric quantization for DeepSeek-V4-Flash — calibrate on YOUR workload, boost the layers it lives in, watch it forge.</div>
+  <div class="sub">Asymmetric quantization for DeepSeek-V4-Flash. <b>Forge</b> a model from a recipe and watch it. The cards below are independent tools — not steps to do in order: <b>build a recipe</b> or <b>explore an imatrix</b> only if you want to go beyond the presets; your outputs land at the bottom.</div>
 </header>
 
 <div class="card">
-  <div class="ch"><span class="step">1</span><h2>Forge</h2><span class="sub">choose a recipe and an action, then run</span></div>
+  <div class="ch"><h2>Forge a model</h2><span class="sub">pick a recipe + action and run it — presets work out of the box; live progress below</span></div>
   <div class="row">
     <select id="recipe" style="min-width:170px"></select>
     <select id="action">
@@ -398,7 +550,7 @@ a.lnk{color:var(--info);text-decoration:none;cursor:pointer}
 </div>
 
 <div class="card">
-  <div class="ch"><span class="step">2</span><h2>Brain map</h2><span class="sub">which paths does a workload light up? pick an imatrix</span></div>
+  <div class="ch"><h2>Brain map</h2><span class="sub">optional · explore where a workload activates, and send a boost down to the recipe builder</span></div>
   <div class="row" style="margin-bottom:12px">
     <select id="imsel" style="min-width:240px"></select>
     <span class="hint">compare with</span>
@@ -407,26 +559,39 @@ a.lnk{color:var(--info);text-decoration:none;cursor:pointer}
     <span class="hint" id="brainmsg"></span>
   </div>
   <div class="brain" id="brainbox" style="display:none">
+    <div id="bbanner" class="bb" style="display:none"></div>
     <canvas id="bmap" width="1024" height="172"></canvas>
     <div class="lay" id="bhover"></div>
-    <div class="legend"><span>rows = 43 layers (top→bottom) · columns = 256 experts</span><span>dim → bright = activation energy</span><span id="bds"></span></div>
+    <div class="legend"><span id="blegend">rows = 43 layers (top→bottom) · columns = 256 experts · dim → bright = activation energy</span><span id="bds"></span></div>
   </div>
   <div class="grp" id="hotbox" style="display:none">
     <div class="lbl">Hot layers <span class="mut" style="font-weight:400">· where this workload concentrates</span></div>
-    <div class="row" style="margin-bottom:8px"><span id="hotpills"></span></div>
+    <div class="row" style="margin-bottom:14px"><span id="hotpills"></span></div>
+
+    <div class="lbl">Boost</div>
+    <div class="cap" id="boosttip"></div>
+    <div class="row" id="presets" style="margin-bottom:12px"></div>
     <div class="row">
-      <span class="hint">boost the top</span>
-      <input id="sugn" value="6" style="width:56px">
-      <span class="hint">layers to</span>
-      <select id="sugt"></select>
+      <span class="hint">or tune:</span>
+      <span class="hint">top</span><input id="sugn" value="6" style="width:50px">
+      <span class="hint">layers ·</span>
+      <select id="sugfam" title="which expert tensors to upcast">
+        <option value="w1,w2,w3">all experts</option>
+        <option value="w2">down-proj only (most sensitive)</option>
+        <option value="w1,w3">gate + up only</option>
+      </select>
+      <span class="hint">to</span><select id="sugt"></select>
       <button onclick="applySuggest()">→ apply to recipe builder</button>
-      <span class="hint" id="sugmsg"></span>
+      <span class="hint hot" id="sugmsg"></span>
     </div>
+    <div class="cap" id="boostsel" style="margin-top:10px"></div>
+    <details class="gtk"><summary>good to know — how to choose</summary>
+      <ul id="boostnotes" style="margin:8px 0 0;padding-left:18px"></ul></details>
   </div>
 </div>
 
 <div class="card">
-  <div class="ch"><span class="step">3</span><h2>Recipe</h2><span class="sub">start from a template, tweak, save</span></div>
+  <div class="ch"><h2>Recipe builder</h2><span class="sub">optional · build or tune a recipe — it then appears in the Forge picker at the top</span></div>
   <div class="grp" style="margin-top:0">
     <div class="lbl">Templates</div>
     <div class="tpl" id="tpls"></div>
@@ -516,8 +681,9 @@ const BC={quantize:'var(--info)',imatrix:'var(--pur)',capture:'var(--hot)',splic
 async function poll(){let s;try{s=await fetch('/api/status').then(r=>r.json());}catch(e){return;}
   const ph=s.phase||'idle';const pe=$('phase');pe.style.display=s.idle?'none':'inline-flex';pe.textContent=ph+(s.signal?' · '+s.signal:s.rc>0?' · rc '+s.rc:'');pe.style.color=BC[ph]||'var(--mut)';
   $('go').disabled=!!s.running;$('stop').disabled=!s.running;
-  let pct=0,lab='idle';
-  if(s.m){pct=Math.round(100*s.n/s.m);lab=`${s.n} / ${s.m} tensors · ${pct}%`;}
+  let pct=s.pct!=null?s.pct:0,lab='idle';
+  if(s.layer!=null&&s.phase==='quantize'){lab=`layer ${s.layer+1} / ${s.n_layers||43} · quantizing experts · ${Math.round(pct)}%`;}
+  else if(s.m){lab=`${s.n} / ${s.m} tensors · ${Math.round(pct)}%`;}
   else if(s.phase==='imatrix'){lab=s.tokens?`${s.tokens.toLocaleString()} tokens collected`:'collecting imatrix…';pct=s.tokens?Math.min(99,s.tokens/1200):5;}
   else if(s.phase==='capture'){lab=s.tokens?`${s.tokens.toLocaleString()} tokens observed — send traffic, Stop when done`:'serving · waiting for traffic…';pct=4;}
   else if(s.phase==='done')lab='done',pct=100;else if(s.phase==='failed')lab='failed'+(s.rc?` (rc ${s.rc})`:'');else if(s.phase==='stopped')lab='stopped';else if(s.running)lab='starting…',pct=2;
@@ -537,7 +703,17 @@ async function loadTypes(){const t=await fetch('/api/types').then(r=>r.json());F
   $('bfam').innerHTML=`<div style="font-size:11px;color:var(--mut2);margin:0 0 6px">routed experts · the 2-bit budget</div><div class="famgrid">${exp.map(fld).join('')}</div>`+
     `<div style="font-size:11px;color:var(--mut2);margin:13px 0 6px">other tensors · keep near-lossless</div><div class="famgrid">${oth.map(fld).join('')}</div>`;
   $('btype').innerHTML=t.boost_types.map(x=>`<option>${x}</option>`).join('');$('btype').value='q4_k';
-  $('sugt').innerHTML=t.boost_types.map(x=>`<option>${x}</option>`).join('');$('sugt').value='q4_k';}
+  $('sugt').innerHTML=t.boost_types.map(x=>`<option>${x}</option>`).join('');$('sugt').value='q4_k';
+  const g=t.boost_guide;if(g){window.GUIDE=g;$('boosttip').textContent=g.tooltip;
+    $('boostsel').innerHTML='<b class="mut">selection:</b> '+esc(g.selection);
+    $('boostnotes').innerHTML=g.notes.map(x=>`<li>${esc(x)}</li>`).join('');
+    $('presets').innerHTML=g.presets.map((p,i)=>`<button class="preset${p.key==='medium'?' rec':''}" data-i="${i}" title="${esc(p.when)}" onclick="applyPreset(${i})"><b>${esc(p.key)}</b><span>${esc(p.label)}</span><span class="pg" id="pg${i}">…</span></button>`).join('');
+    $('sugn').value=g.default_n;}}
+function applyPreset(i){const p=window.GUIDE.presets[i];
+  document.querySelectorAll('.preset').forEach(e=>e.classList.toggle('sel',+e.dataset.i===i));
+  $('sugn').value=p.n;$('sugt').value=p.type;
+  $('sugfam').value=(p.families.length===3?'w1,w2,w3':p.families.join(','));
+  applySuggest();}
 async function loadImats(){const im=await fetch('/api/imatrices').then(r=>r.json());
   const opt=im.map(x=>`<option value="${esc(x.name)}">${esc(x.name)} · ${x.mb}MB${x.analyzed?' ·✓':''}</option>`).join('');
   const s=$('bimat'),cur=s.value;
@@ -552,10 +728,11 @@ async function useTpl(n){document.querySelectorAll('.tplc').forEach(e=>e.classLi
   $('bname').value=r.name||n;$('bdesc').value=r.description||'';$('bhf').value=r.hf||'';$('btmpl').value=r.template||'';
   FAMS.forEach(f=>{const s=$('f_'+f);if(s)s.value=(r.quant||{})[f]||'';});
   $('blayers').value=(r.boost||{}).layers||'';$('btype').value=(r.boost||{}).type||'q4_k';
+  window.BOOST_FAM=(r.boost||{}).families||[];
   $('bimat').value=r.imatrix||'';$('bcorpus').value=r.corpus||'';$('bmaxtok').value=r.imatrix_max_tokens||'';$('bimat').onchange();}
 async function saveRecipe(){const quant={};FAMS.forEach(f=>{const v=$('f_'+f).value;if(v)quant[f]=v;});
   const body={name:$('bname').value,description:$('bdesc').value,hf:$('bhf').value,template:$('btmpl').value,quant,
-    boost:{layers:$('blayers').value.trim(),type:$('btype').value}};
+    boost:{layers:$('blayers').value.trim(),type:$('btype').value,families:window.BOOST_FAM||[]}};
   // always send max-tokens key in corpus mode so clearing the field reaches the server's remove branch
   if($('bimat').value)body.imatrix=$('bimat').value;else if($('bcorpus').value){body.corpus=$('bcorpus').value;body.imatrix_max_tokens=$('bmaxtok').value;}
   const res=await fetch('/api/save_recipe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
@@ -566,35 +743,68 @@ async function loadBrain(){const n=$('imsel').value;if(!n)return;
   try{
     const s=await fetch('/api/imatrix_stats?file='+encodeURIComponent(n)).then(r=>r.json());
     if(s.error){$('brainmsg').textContent='error — '+esc(s.error);BRAIN=null;$('brainbox').style.display='none';$('hotbox').style.display='none';return;}
-    BRAIN=s;let diff=null;
-    if($('imdiff').value&&$('imdiff').value!==n)
-      diff=await fetch(`/api/imatrix_diff?a=${encodeURIComponent($('imdiff').value)}&b=${encodeURIComponent(n)}`).then(r=>r.json());
-    drawBrain(s,diff);
+    BRAIN=s;const baseName=$('imdiff').value;let base=null;
+    if(baseName&&baseName!==n){
+      base=await fetch('/api/imatrix_stats?file='+encodeURIComponent(baseName)).then(r=>r.json());
+      if(base.error){$('brainmsg').textContent='error — '+esc(base.error);return;}
+    }
+    const info=drawBrain(s,base);
+    const bn=$('bbanner');
+    if(base){bn.style.display='';
+      if(info.identical){bn.className='bb ok';bn.textContent='✓ exact match — these two imatrices light up identically';
+        $('blegend').textContent=`comparing ${esc(n.replace('.dat',''))} vs ${esc(baseName.replace('.dat',''))} — no differences`;}
+      else{bn.className='bb hot';bn.textContent=`differences highlighted · ${info.changed} of ${s.layers.length*s.n_experts} expert-cells changed`;
+        $('blegend').textContent=`warm = ${esc(n.replace('.dat',''))}-leaning · cool = ${esc(baseName.replace('.dat',''))}-leaning · dark = same`;}
+    }else{bn.style.display='none';
+      $('blegend').textContent='rows = 43 layers (top→bottom) · columns = 256 experts · dim → bright = activation energy';}
     $('brainmsg').textContent='';$('bds').textContent=s.dataset?('corpus: '+(''+s.dataset).split('/').pop()):'live capture';
-    const hot=(s.hot_layers||[]).slice(0,8);
-    $('hotpills').innerHTML=hot.map(l=>`<span class="pill hot">blk.${l}</span>`).join('');
-    $('hotbox').style.display='';$('brainbox').style.display='';
+    $('hotpills').innerHTML=(s.hot_layers||[]).slice(0,8).map(l=>`<span class="pill hot">blk.${l}</span>`).join('');
+    $('hotbox').style.display='';$('brainbox').style.display='';refreshPresetGB();
   }finally{$('brainbtn').disabled=false;}}
-function drawBrain(s,diff){const cv=$('bmap'),ctx=cv.getContext('2d');
+function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
   const L=s.layers.length,E=s.n_experts,cw=4,chh=4;cv.width=E*cw;cv.height=L*chh;
   ctx.fillStyle='#050505';ctx.fillRect(0,0,cv.width,cv.height);
-  const donly={};if(diff&&diff.rows)diff.rows.forEach(r=>donly[r.layer]=new Set(r.experts_only_b));
-  s.layers.forEach((row,i)=>{row.heat.forEach((v,e)=>{
-    if(v<=0)return;
-    if(donly[row.layer]&&donly[row.layer].has(e)){ctx.fillStyle=`rgb(255,120,60)`;}
-    else{const c=Math.round(30+v*215);ctx.fillStyle=`rgb(${Math.round(c*0.55)},${Math.round(c*0.8)},${c})`;}
+  if(base){
+    // compare: colour each cell by the SIGNED difference of global activation share, so only
+    // the areas that change light up (warm = this-leaning, cool = baseline-leaning, dark = same)
+    const bl={};base.layers.forEach(r=>bl[r.layer]=r);
+    let maxd=0;const D=[];
+    s.layers.forEach(row=>{const br=bl[row.layer];
+      const ss=row.heat.reduce((a,b)=>a+b,0)||1,bs=br?(br.heat.reduce((a,b)=>a+b,0)||1):1;
+      const dr=row.heat.map((h,e)=>(h/ss*row.share)-(br?(br.heat[e]/bs*br.share):0));
+      D.push(dr);dr.forEach(d=>{if(Math.abs(d)>maxd)maxd=Math.abs(d);});});
+    const identical=maxd<1e-5;let changed=0;
+    if(!identical)s.layers.forEach((row,i)=>{D[i].forEach((d,e)=>{const m=Math.abs(d)/maxd;if(m<0.06)return;changed++;
+      const c=Math.round(45+m*210);
+      ctx.fillStyle=d>0?`rgb(${c},${Math.round(c*0.5)},${Math.round(c*0.3)})`:`rgb(${Math.round(c*0.35)},${Math.round(c*0.65)},${c})`;
+      ctx.fillRect(e*cw,i*chh,cw-1,chh-1);});});
+    cv.onmousemove=ev=>{const r=cv.getBoundingClientRect();
+      const e=Math.floor((ev.clientX-r.left)/r.width*E),l=Math.floor((ev.clientY-r.top)/r.height*L);
+      if(!s.layers[l]||!D[l])return;const d=D[l][e]||0;
+      $('bhover').textContent=`blk.${s.layers[l].layer} · expert ${e} · Δshare ${(d*100>=0?'+':'')}${(d*100).toFixed(3)}% · ${d>0?'this':'baseline'}-leaning`;};
+    return {identical,changed};
+  }
+  s.layers.forEach((row,i)=>{row.heat.forEach((v,e)=>{if(v<=0)return;
+    const c=Math.round(30+v*215);ctx.fillStyle=`rgb(${Math.round(c*0.55)},${Math.round(c*0.8)},${c})`;
     ctx.fillRect(e*cw,i*chh,cw-1,chh-1);});});
   cv.onmousemove=ev=>{const r=cv.getBoundingClientRect();
     const e=Math.floor((ev.clientX-r.left)/r.width*E),l=Math.floor((ev.clientY-r.top)/r.height*L);
     const row=s.layers[l];if(!row)return;
-    $('bhover').textContent=`blk.${row.layer} · expert ${e} · heat ${(row.heat[e]||0).toFixed(2)} · layer share ${(row.share*100).toFixed(1)}% · ${row.active}/${E} experts active`;};}
-async function applySuggest(){if(!BRAIN)return;const n=parseInt($('sugn').value)||6,t=$('sugt').value;
-  const s=await fetch(`/api/suggest?imatrix=${encodeURIComponent($('imsel').value)}&top=${n}&type=${t}`).then(r=>r.json());
-  if(s.error){$('sugmsg').textContent=s.error;return;}
-  $('blayers').value='auto:'+n;$('btype').value=t;
+    $('bhover').textContent=`blk.${row.layer} · expert ${e} · heat ${(row.heat[e]||0).toFixed(2)} · layer share ${(row.share*100).toFixed(1)}% · ${row.active}/${E} experts active`;};
+  return {identical:false,changed:0};}
+async function applySuggest(){if(!BRAIN)return;const n=parseInt($('sugn').value)||6,t=$('sugt').value,fam=$('sugfam').value;
+  const s=await fetch(`/api/suggest?imatrix=${encodeURIComponent($('imsel').value)}&top=${n}&type=${t}&families=${encodeURIComponent(fam)}`).then(r=>r.json());
+  if(s.error){$('sugmsg').textContent=esc(s.error);return;}
+  $('blayers').value='auto:'+n;$('btype').value=t;window.BOOST_FAM=s.families;
   $('bimat').value='{models}/'+$('imsel').value;$('bimat').onchange();
-  $('sugmsg').textContent=`layers ${s.layers.join(',')} ≈ +${s.delta_gb} GB — set in builder below`;
+  const fl=s.families.length===3?'all experts':(fam==='w2'?'down-proj only':'gate+up');
+  $('sugmsg').textContent=`auto:${n} · ${fl} · ≈ +${s.delta_gb} GB → applied to the builder`;
   $('bdelta').textContent=`≈ +${s.delta_gb} GB`;}
+async function refreshPresetGB(){if(!window.GUIDE||!$('imsel').value)return;
+  for(let i=0;i<window.GUIDE.presets.length;i++){const p=window.GUIDE.presets[i];
+    const fam=p.families.length===3?'w1,w2,w3':p.families.join(',');
+    try{const s=await fetch(`/api/suggest?imatrix=${encodeURIComponent($('imsel').value)}&top=${p.n}&type=${p.type}&families=${fam}`).then(r=>r.json());
+      if(!s.error&&$('pg'+i))$('pg'+i).textContent='≈ +'+s.delta_gb+' GB';}catch(e){}}}
 async function loadRuns(){const rs=await fetch('/api/runs').then(r=>r.json());
   $('runs').innerHTML=rs.map(x=>`<tr><td class="mut">${esc(x.when)}</td><td>${esc(x.recipe)}</td><td>${esc(x.action)}</td><td><a class="lnk" data-f="${esc(x.file)}" onclick="showLog(this.dataset.f)">${esc(x.file)}</a> <span class="mut">· ${x.kb} KB</span></td></tr>`).join('')||'<tr><td colspan=4 class="mut">no runs yet</td></tr>';}
 async function showLog(f){const l=await fetch('/api/runlog?f='+encodeURIComponent(f)).then(r=>r.json());
@@ -627,13 +837,14 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/models": self._json(list_models())
         elif p == "/api/status": self._json(job_status())
         elif p == "/api/types": self._json({"types": QUANT_TYPES, "families": FAMILIES,
-                                            "boost_types": BOOST_TYPES})
+                                            "boost_types": BOOST_TYPES, "boost_guide": BOOST_GUIDE})
         elif p == "/api/imatrices": self._json(list_imatrices())
         elif p == "/api/imatrix_stats": self._json(imatrix_stats(arg("file")))
         elif p == "/api/imatrix_diff": self._json(imatrix_diff(arg("a"), arg("b")))
         elif p == "/api/suggest":
+            fams = tuple(f for f in arg("families").split(",") if f in ("w1", "w2", "w3")) or ("w1", "w2", "w3")
             self._json(suggest(arg("imatrix"), max(1, min(43, intarg("top", 6))),
-                               arg("type") if arg("type") in BOOST_TYPES else "q4_k"))
+                               arg("type") if arg("type") in BOOST_TYPES else "q4_k", fams))
         elif p == "/api/runs": self._json(list_runs())
         elif p == "/api/runlog": self._json(run_log(arg("f")))
         elif p == "/api/defaults": self._json(defaults())

@@ -10,7 +10,7 @@ import forge_imatrix, forge_corpus, forgequant, forge_ui, forge_bench
 
 
 def write_dat(path, layers=2, n_experts=4, gate_cols=8, down_cols=4, hot_layer=1,
-              cold_expert=3, dataset="synthetic.txt"):
+              cold_expert=3, hot_expert=2, dataset="synthetic.txt"):
     """Synthetic .dat in ds4's exact legacy layout."""
     entries = []
     for l in range(layers):
@@ -22,7 +22,7 @@ def write_dat(path, layers=2, n_experts=4, gate_cols=8, down_cols=4, hot_layer=1
                 if e == cold_expert:
                     vals += [0.0] * ncols          # never-routed expert
                 else:
-                    base = (10.0 if l == hot_layer else 1.0) * (3.0 if e == 2 else 1.0)
+                    base = (10.0 if l == hot_layer else 1.0) * (3.0 if e == hot_expert else 1.0)
                     vals += [base] * ncols
             entries.append((tname, vals))
     with open(path, "wb") as f:
@@ -109,6 +109,37 @@ class TestImatrix(unittest.TestCase):
             f.truncate(40)
         with self.assertRaises(forge_imatrix.ImatrixError):
             forge_imatrix.load_dat(self.dat)
+
+    def test_contrast_finds_divergent_layer(self):
+        # domain emphasizes expert 2; base emphasizes expert 0 — same shape, different experts.
+        # The absolute heatmaps are similar, but contrast must surface the per-expert divergence.
+        dom_p = os.path.join(self.tmp.name, "dom.dat")
+        base_p = os.path.join(self.tmp.name, "base.dat")
+        write_dat(dom_p, hot_layer=1, hot_expert=2)
+        write_dat(base_p, hot_layer=1, hot_expert=0)
+        dom = forge_imatrix.analyze(forge_imatrix.load_dat(dom_p), 4)
+        base = forge_imatrix.analyze(forge_imatrix.load_dat(base_p), 4)
+        rows = forge_imatrix.contrast(dom, base)
+        self.assertEqual(rows[0]["layer"], 1)          # the hot layer is where they diverge most
+        self.assertEqual(rows[0]["lean"], "domain")
+        self.assertIn(2, rows[0]["experts"])           # expert 2 is the domain-distinctive one
+        self.assertEqual(forge_imatrix.suggest_contrast(dom, base, 1), [1])
+
+    def test_contrast_bars_render(self):
+        dom = forge_imatrix.analyze(forge_imatrix.load_dat(self.dat), 4)
+        bars = forge_imatrix.contrast_bars(forge_imatrix.contrast(dom, dom), domain="d", base="b")
+        self.assertIn("contrast  d ↔ b", bars)         # self-contrast: all zero divergence, no crash
+
+    def test_contrast_cached_matches(self):
+        dom_p = os.path.join(self.tmp.name, "dom.dat")
+        base_p = os.path.join(self.tmp.name, "base.dat")
+        write_dat(dom_p, hot_layer=1, hot_expert=2)
+        write_dat(base_p, hot_layer=1, hot_expert=0)
+        cd = forge_imatrix.cached_stats(dom_p, 4)
+        cb = forge_imatrix.cached_stats(base_p, 4)
+        rows = forge_imatrix.contrast_cached(cd, cb)
+        self.assertEqual(rows[0]["layer"], 1)
+        self.assertEqual(rows[0]["lean"], "domain")
 
 
 class TestCorpus(unittest.TestCase):
@@ -236,9 +267,30 @@ class TestForgequant(unittest.TestCase):
 
     def test_presets_load(self):
         for name in ("coder-q4boost", "medical-q4boost", "last6-q4boost", "splice-fast",
-                     "medical-iq2", "coder-iq2", "balanced", "aggressive"):
+                     "medical-iq2", "coder-iq2", "balanced", "aggressive",
+                     "coder-contrast", "general-baseline"):
             r = forgequant.load_recipe(name)
             self.assertTrue(r["out"].endswith(".gguf"))
+
+    def test_contrast_boost_needs_baseline(self):
+        import tempfile, json as _j
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"name": "x", "hf": "/h", "template": "/t",
+                   "boost": {"mode": "contrast", "layers": "auto:6", "type": "q4_k"}}
+            p = os.path.join(tmp, "x.json"); _j.dump(rec, open(p, "w"))
+            with self.assertRaises(SystemExit):       # missing boost.baseline
+                forgequant.load_recipe(p)
+
+    def test_contrast_boost_resolves_layers(self):
+        # a contrast-mode boost picks divergent layers from imatrix vs baseline
+        with tempfile.TemporaryDirectory() as tmp:
+            dom = os.path.join(tmp, "dom.dat"); base = os.path.join(tmp, "base.dat")
+            write_dat(dom, hot_layer=1, hot_expert=2, n_experts=256, gate_cols=2, down_cols=2)
+            write_dat(base, hot_layer=1, hot_expert=0, n_experts=256, gate_cols=2, down_cols=2)
+            r = {"name": "x", "hf": "/h", "template": "/t", "out": "/o.gguf", "imatrix": dom,
+                 "boost": {"mode": "contrast", "baseline": base, "layers": "auto:1", "type": "q4_k"}}
+            ov = forgequant.boost_overrides(r)
+            self.assertEqual(sorted(set(int(p.split(".")[1]) for p, _ in ov)), [1])
 
     def test_tensor_types_passthrough(self):
         r = {"name": "t", "hf": "/hf", "template": "/t.gguf", "out": "/o.gguf",

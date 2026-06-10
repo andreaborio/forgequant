@@ -116,6 +116,13 @@ def load_recipe(arg):
         if not b.get("type"): die("boost needs a `type` (e.g. q4_k)")
         check_type(b["type"], "boost.type")
         if "layers" not in b: die("boost needs `layers` (e.g. \"37-42\" or \"auto:6\")")
+        if b.get("mode") not in (None, "energy", "contrast"):
+            die("boost.mode must be 'energy' (default) or 'contrast'")
+        if b.get("mode") == "contrast":
+            b["baseline"] = resolve(b.get("baseline"), r["name"])
+            if not b["baseline"]:
+                die("contrast boost needs `boost.baseline` (a general/other-domain imatrix .dat "
+                    "to contrast against — boosts the layers THIS domain uses differently)")
     return r
 
 def _check_range(layers):
@@ -148,11 +155,28 @@ def parse_layers(spec, recipe=None):
     if not out: die(f"empty boost layer spec: {spec!r}")
     return _check_range(sorted(out))
 
+def resolve_boost_layers(r, b):
+    """Layers to upcast. mode 'energy' (default): the hottest layers of the recipe's imatrix.
+    mode 'contrast': the layers this domain's imatrix uses most DIFFERENTLY from a baseline —
+    i.e. the domain-distinctive layers, not the generally-hot ones."""
+    spec = b["layers"]
+    if b.get("mode") == "contrast" and isinstance(spec, str) and spec.startswith("auto:"):
+        n = int(spec.split(":", 1)[1])
+        if not r.get("imatrix") or not os.path.exists(r.get("imatrix") or ""):
+            die("contrast boost 'auto:N' needs the recipe's domain imatrix — run `imatrix`/`capture` first")
+        if not os.path.exists(b["baseline"]):
+            die(f"contrast baseline not found: {b['baseline']} — build a general imatrix "
+                "(e.g. `bench corpus broad` -> imatrix) to contrast against")
+        dom = forge_imatrix.analyze(forge_imatrix.load_dat(r["imatrix"]))
+        base = forge_imatrix.analyze(forge_imatrix.load_dat(b["baseline"]))
+        return _check_range(forge_imatrix.suggest_contrast(dom, base, n))
+    return parse_layers(spec, r)
+
 def boost_overrides(r):
     """Expand the recipe's `boost` block into ordered (tensor-prefix, type) pairs."""
     b = r.get("boost")
     if not b: return []
-    layers = parse_layers(b["layers"], r)
+    layers = resolve_boost_layers(r, b)
     fams = b.get("families") or ["w1", "w2", "w3"]
     return [(f"blk.{l}.{BOOST_TENSOR[f]}.weight", b["type"]) for l in layers for f in fams]
 
@@ -466,6 +490,17 @@ def cmd_paths(a, extra):
     stats = forge_imatrix.analyze(forge_imatrix.load_dat(dat))
     if "--json" in extra:
         print(json.dumps(forge_imatrix.to_json(stats), indent=2)); return
+    if "--contrast" in extra:
+        # the legible compare: one diverging bar per layer, not two 43x256 grids
+        base_dat = _dat_of(opt(extra, "--contrast"))
+        base = forge_imatrix.analyze(forge_imatrix.load_dat(base_dat))
+        rows = forge_imatrix.contrast(stats, base)
+        dn = os.path.basename(a) if a.endswith(".dat") else a
+        bn = os.path.basename(opt(extra, "--contrast"))
+        print(forge_imatrix.contrast_bars(rows, domain=dn, base=bn))
+        print(f"\ncontrast boost candidates (most domain-distinctive): "
+              f"{forge_imatrix.suggest_contrast(stats, base, 6)}")
+        return
     if "--diff" in extra:
         other = forge_imatrix.analyze(forge_imatrix.load_dat(_dat_of(opt(extra, "--diff"))))
         print("layer  cosine  Δshare   experts only in domain")
