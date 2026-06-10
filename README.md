@@ -166,6 +166,7 @@ Stdlib only; same `DS4_DIR` / `MODELS_DIR` config.
     "families": ["w1","w2","w3"]                // optional subset
   },
   "tensor_types": {"blk.0.": "q8_0"},          // raw --tensor-type prefix overrides (optional)
+  "reuse": "{models}/DeepSeek-V4-Flash-coder-iq2.gguf",  // copy unchanged tensors from a prior build (optional)
   "splice": {                                   // fast layer boost without requantizing (optional)
     "donor": "{models}/<q4-variant>.gguf",
     "layers": "auto:6"
@@ -192,12 +193,21 @@ quant target type", so forgequant validates recipes up front.
 |---|---|---|
 | family (all experts) | `quant` → `--routed-w1/w2/w3` | full requantize |
 | expert (within a tensor) | `imatrix` — per-expert bit steering, automatic | imatrix run |
-| layer (chosen experts ×3 tensors) | `boost` → `--tensor-type` overrides | full requantize |
+| layer (chosen experts ×3 tensors) | `boost` → `--tensor-type` overrides | requantize **changed layers only** with `reuse` |
 | layer, instantly | `splice` — copy from donor GGUF | **minutes** |
 
 Per-expert *types* inside one fused tensor aren't possible (GGUF stores one type
 per tensor; verified in `deepseek4-quantize.c`) — the imatrix's per-expert bit
 steering plus layer boost is the practical equivalent.
+
+**`reuse` (incremental re-quantize).** A boost only changes a few layers, but a
+plain requantize regenerates all 43 from FP. Point `reuse` at a prior build with the
+**same imatrix** (e.g. a `coder-iq2` for a `coder-q4boost`) and the quantizer copies
+the byte-identical unchanged tensors, regenerating only the boosted ones — ~85% less
+work. Safe by construction: it's gated on a `quantize.reuse_key` (hash of the
+safetensors index + imatrix) plus a per-tensor type/shape match, so a mismatched or
+missing prior falls back to a full quantize. Needs ds4's
+[`deepseek4-quantize --reuse`](https://github.com/andreaborio/ds4) (this fork).
 
 ## Presets
 
