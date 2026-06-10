@@ -575,7 +575,7 @@ details.gtk>summary::-webkit-details-marker{display:none}
     <div class="legend"><span id="blegend">rows = 43 layers (top→bottom) · columns = 256 experts · dim → bright = activation energy</span><span id="bds"></span></div>
   </div>
   <div class="grp" id="hotbox" style="display:none">
-    <div class="lbl">Hot layers <span class="mut" style="font-weight:400">· where this workload concentrates</span></div>
+    <div class="lbl" id="hotlbl">Hot layers <span class="mut" style="font-weight:400">· where this workload concentrates</span></div>
     <div class="row" style="margin-bottom:14px"><span id="hotpills"></span></div>
 
     <div class="lbl">Boost</div>
@@ -768,7 +768,14 @@ async function loadBrain(){const n=$('imsel').value;if(!n)return;
     }else{bn.style.display='none';
       $('blegend').textContent='rows = 43 layers (top→bottom) · columns = 256 experts · dim → bright = activation energy';}
     $('brainmsg').textContent='';$('bds').textContent=s.dataset?('corpus: '+(''+s.dataset).split('/').pop()):'live capture';
-    $('hotpills').innerHTML=(s.hot_layers||[]).slice(0,8).map(l=>`<span class="pill hot">blk.${l}</span>`).join('');
+    if(base&&info.top){
+      $('hotlbl').innerHTML='Most distinctive layers <span class="mut" style="font-weight:400">· where this workload diverges most from the baseline</span>';
+      $('hotpills').innerHTML=info.top.slice(0,8).map(t=>`<span class="pill hot">blk.${t.layer} · ${(t.div*100).toFixed(2)}%</span>`).join('');
+    }else{
+      $('hotlbl').innerHTML='Hot layers <span class="mut" style="font-weight:400">· where this workload concentrates</span>';
+      const sh={};(s.layers||[]).forEach(r=>sh[r.layer]=r.share);
+      $('hotpills').innerHTML=(s.hot_layers||[]).slice(0,8).map(l=>`<span class="pill hot">blk.${l}${sh[l]!=null?' · '+(sh[l]*100).toFixed(1)+'%':''}</span>`).join('');
+    }
     $('hotbox').style.display='';$('brainbox').style.display='';refreshPresetGB();
   }finally{$('brainbtn').disabled=false;}}
 function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
@@ -796,7 +803,9 @@ function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
       const e=Math.floor((ev.clientX-r.left)/r.width*E),l=Math.floor((ev.clientY-r.top)/r.height*L);
       if(!s.layers[l]||!D[l])return;const d=D[l][e]||0;
       $('bhover').textContent=`blk.${s.layers[l].layer} · expert ${e} · Δshare ${(d*100>=0?'+':'')}${(d*100).toFixed(3)}% · ${d>0?'this':'baseline'}-leaning`;};
-    return {identical,changed};
+    // per-layer divergence (sum of |Δshare| across experts) = how differently this layer is used
+    const top=s.layers.map((row,i)=>({layer:row.layer,div:D[i].reduce((a,d)=>a+Math.abs(d),0)})).sort((a,b)=>b.div-a.div);
+    return {identical,changed,top};
   }
   s.layers.forEach((row,i)=>{row.heat.forEach((v,e)=>{if(v<=0)return;
     const c=Math.round(30+v*215);ctx.fillStyle=`rgb(${Math.round(c*0.55)},${Math.round(c*0.8)},${c})`;
@@ -805,7 +814,7 @@ function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
     const e=Math.floor((ev.clientX-r.left)/r.width*E),l=Math.floor((ev.clientY-r.top)/r.height*L);
     const row=s.layers[l];if(!row)return;
     $('bhover').textContent=`blk.${row.layer} · expert ${e} · heat ${(row.heat[e]||0).toFixed(2)} · layer share ${(row.share*100).toFixed(1)}% · ${row.active}/${E} experts active`;};
-  return {identical:false,changed:0};}
+  return {identical:false,changed:0,top:null};}
 async function applySuggest(){if(!BRAIN)return;const n=parseInt($('sugn').value)||6,t=$('sugt').value,fam=$('sugfam').value;
   const s=await fetch(`/api/suggest?imatrix=${encodeURIComponent($('imsel').value)}&top=${n}&type=${t}&families=${encodeURIComponent(fam)}`).then(r=>r.json());
   if(s.error){$('sugmsg').textContent=esc(s.error);return;}
