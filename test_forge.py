@@ -298,6 +298,16 @@ class TestForgequant(unittest.TestCase):
         cmd = forgequant.quant_cmd(r)
         self.assertIn("blk.0.=q8_0", cmd)
 
+    def test_reuse_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = os.path.join(tmp, "prior.gguf"); open(prior, "w").close()
+            r = {"name": "t", "hf": "/hf", "template": "/t.gguf", "out": "/o.gguf", "reuse": prior}
+            cmd = forgequant.quant_cmd(r)
+            self.assertEqual(cmd[cmd.index("--reuse") + 1], prior)      # present -> passed
+            self.assertNotIn("--reuse", forgequant.quant_cmd(r, dry=True))  # never on dry-run
+            r["reuse"] = os.path.join(tmp, "missing.gguf")
+            self.assertNotIn("--reuse", forgequant.quant_cmd(r))        # missing -> full quantize
+
     def test_producible_type_guard(self):
         # q3_k / iq3_xxs are NOT producible by deepseek4-quantize (ds4q_can_quantize)
         import tempfile, json as _j

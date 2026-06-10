@@ -39,6 +39,10 @@ verbatim from `template`. Extra keys:
                    "families": ["w1","w2","w3"]}   per-layer expert upcast, expands
                   to --tensor-type overrides; "auto:N" picks the N hottest layers
                   from the recipe's imatrix (run `imatrix`/`capture` first)
+  "reuse":        "{models}/DeepSeek-V4-Flash-coder-iq2.gguf"   copy byte-identical
+                  tensors from a prior build (same hf+imatrix) instead of regenerating —
+                  only changed (e.g. boosted) tensors are quantized. Missing prior or a
+                  key mismatch safely falls back to a full quantize.
   "tensor_types": {"blk.0.": "q8_0", ...}          raw --tensor-type prefix overrides
   "splice":       {"donor": "...gguf", "layers": "37-42" | "auto:6", "out": "..."}
   "threads": N, "imatrix_ctx": N, "imatrix_cache": "40GB", "imatrix_max_tokens": N,
@@ -98,7 +102,7 @@ def load_recipe(arg):
     except Exception as e:
         die(f"invalid recipe JSON {path}: {e}")
     r["name"] = r.get("name") or os.path.basename(path)[:-5]
-    for k in ("hf", "template", "imatrix", "corpus", "out"):
+    for k in ("hf", "template", "imatrix", "corpus", "out", "reuse"):
         if r.get(k): r[k] = resolve(r[k], r["name"])
     if not r.get("out"):
         r["out"] = os.path.join(MODELS_DIR, f"DeepSeek-V4-Flash-{r['name']}.gguf")
@@ -196,6 +200,16 @@ def quant_cmd(r, dry=False):
              [(p, t, 1) for p, t in boost_overrides(r)]
     for pfx, t, _ in sorted(tagged, key=lambda x: (-len(x[0]), x[2])):
         cmd += ["--tensor-type", f"{pfx}={t}"]
+    # reuse: copy byte-identical tensors from a prior build (same hf+imatrix) instead of
+    # regenerating — only the changed (e.g. boosted) tensors are quantized. The quantizer
+    # verifies a matching reuse key, so a stale/mismatched prior safely falls back to a full
+    # quantize. Skip silently if the prior isn't there yet.
+    reuse = r.get("reuse")
+    if reuse and not dry:
+        if os.path.exists(reuse):
+            cmd += ["--reuse", reuse]
+        else:
+            print(f"forgequant: reuse prior not found ({reuse}) — doing a full quantize", file=sys.stderr)
     if r.get("threads"): cmd += ["--threads", str(r["threads"])]
     if r.get("overwrite"): cmd += ["--overwrite"]
     if dry: cmd += ["--dry-run"]
