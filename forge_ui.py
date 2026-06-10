@@ -803,8 +803,10 @@ function drawBrain(s,base){const cv=$('bmap'),ctx=cv.getContext('2d');
       const e=Math.floor((ev.clientX-r.left)/r.width*E),l=Math.floor((ev.clientY-r.top)/r.height*L);
       if(!s.layers[l]||!D[l])return;const d=D[l][e]||0;
       $('bhover').textContent=`blk.${s.layers[l].layer} · expert ${e} · Δshare ${(d*100>=0?'+':'')}${(d*100).toFixed(3)}% · ${d>0?'this':'baseline'}-leaning`;};
-    // per-layer divergence (sum of |Δshare| across experts) = how differently this layer is used
-    const top=s.layers.map((row,i)=>({layer:row.layer,div:D[i].reduce((a,d)=>a+Math.abs(d),0)})).sort((a,b)=>b.div-a.div);
+    // per-layer divergence = sum of POSITIVE Δshare (the experts the domain drives MORE than the
+    // baseline), exactly forge_imatrix.contrast(): captures domain-distinctive layers and ranks a
+    // high-churn-but-net-baseline layer (blk.42 here) low, instead of mistaking churn for signal
+    const top=s.layers.map((row,i)=>({layer:row.layer,div:D[i].reduce((a,d)=>a+(d>0?d:0),0)})).sort((a,b)=>b.div-a.div);
     return {identical,changed,top};
   }
   s.layers.forEach((row,i)=>{row.heat.forEach((v,e)=>{if(v<=0)return;
